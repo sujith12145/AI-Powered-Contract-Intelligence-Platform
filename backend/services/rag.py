@@ -14,10 +14,15 @@ text — plug in OpenAI/Gemini by replacing `_compose_answer()`.
 """
 from __future__ import annotations
 
+import os
 import re
+import httpx
+import logging
 from typing import Dict, List
 
 from cuad_index import CUADIndex
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -158,6 +163,74 @@ def _action_note(intent: str) -> str:
 # Public API                                                           #
 # ------------------------------------------------------------------ #
 
+def _call_llm_api(question: str, retrieved_clauses: List[Dict], contract_name: str) -> str:
+    """
+    Attempt to use the Gemini API to summarize and answer the question using the retrieved clauses.
+    Times out after 8 seconds and falls back to template-based response on failure.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        logger.info("GEMINI_API_KEY not set. Using template-based answer generation.")
+        return _compose_answer(question, retrieved_clauses, contract_name)
+
+    # Prepare context from retrieved clauses
+    context_str = ""
+    for c in retrieved_clauses:
+        context_str += f"Section: {c.get('section', 'N/A')}\nText: {c.get('text', '')}\n\n"
+
+    prompt = (
+        f"You are a helpful legal assistant for ContractIQ. Answer the question about the contract '{contract_name}' "
+        f"using only the following retrieved clauses from the contract. If the answer cannot be found in the context, "
+        f"say so clearly.\n\n"
+        f"Context:\n{context_str}\n"
+        f"Question: {question}\n"
+        f"Answer:"
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
+    # Standard Gemini v1beta API endpoint
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+
+    logger.info("Sending request to Gemini API (timeout=8s) for query: '%s'...", question)
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            response = client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            res_json = response.json()
+            # Extract content from Gemini response structure
+            answer = res_json['candidates'][0]['content']['parts'][0]['text']
+            return answer.strip()
+    except (httpx.TimeoutException, httpx.RequestError) as err:
+        logger.error("Gemini API network call failed/timed out: %s. Falling back to template-based response.", err, exc_info=True)
+        fallback_ans = _compose_answer(question, retrieved_clauses, contract_name)
+        return (
+            "[Note: The AI assistant is operating in degraded mode due to a temporary LLM API timeout/connection failure. "
+            "Below is the direct contract clause extraction for your query.]\n\n" + fallback_ans
+        )
+    except Exception as err:
+        logger.error("Gemini API error occurred: %s. Falling back to template-based response.", err, exc_info=True)
+        fallback_ans = _compose_answer(question, retrieved_clauses, contract_name)
+        return (
+            "[Note: The AI assistant is operating in degraded mode due to a temporary LLM API error. "
+            "Below is the direct contract clause extraction for your query.]\n\n" + fallback_ans
+        )
+
+
+# ------------------------------------------------------------------ #
+# Public API                                                           #
+# ------------------------------------------------------------------ #
+
 def answer_question(
     question: str,
     contract_id: str,
@@ -173,15 +246,47 @@ def answer_question(
           "citations": [{"section": str, "text": str, "score": float}]
         }
     """
+    # If ChromaDB collection is empty or uninitialized
+    if index._collection is None:
+        logger.warning("RAG Warning - ChromaDB collection is uninitialized.")
+        return {
+            "content": "No contract clauses have been indexed yet. Please upload a contract first before asking questions.",
+            "citations": []
+        }
+        
+    try:
+        count = index._collection.count()
+        if count == 0:
+            logger.warning("RAG Warning - ChromaDB collection is empty.")
+            return {
+                "content": "No contract clauses have been indexed yet. Please upload a contract first before asking questions.",
+                "citations": []
+            }
+    except Exception as exc:
+        logger.error("RAG Failed - Failed to check collection count: %s", exc, exc_info=True)
+        return {
+            "content": "[Note: The AI assistant's search engine is temporarily unavailable due to a database error. Please try again later.]",
+            "citations": []
+        }
+
     # Retrieve relevant clauses — first try contract-specific, then CUAD-wide
-    retrieved = index.query_rag(question, contract_id=contract_id, n=4)
+    try:
+        retrieved = index.query_rag(question, contract_id=contract_id, n=4)
+        # If no contract-specific clauses found (e.g. mock contract), fall back
+        # to searching the whole CUAD corpus
+        if not retrieved:
+            retrieved = index.query_rag(question, contract_id=None, n=4)
+    except Exception as exc:
+        logger.error("RAG Failed - Vector search query failed: %s", exc, exc_info=True)
+        return {
+            "content": "[Note: The AI assistant's search engine is temporarily unavailable due to a database query error. Please try again later.]",
+            "citations": []
+        }
 
-    # If no contract-specific clauses found (e.g. mock contract), fall back
-    # to searching the whole CUAD corpus
     if not retrieved:
-        retrieved = index.query_rag(question, contract_id=None, n=4)
-
-    answer = _compose_answer(question, retrieved, contract_name)
+        answer = _compose_answer(question, retrieved, contract_name)
+    else:
+        answer = _call_llm_api(question, retrieved, contract_name)
 
     citations = [
         {

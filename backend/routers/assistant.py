@@ -1,54 +1,84 @@
 """
 routers/assistant.py
 ====================
-POST /api/assistant/ask   – answer a question about a contract using RAG
+POST /api/v1/assistant/ask  — answer a question about a contract using RAG
+
+Security controls:
+  ✅ JWT authentication required
+  ✅ Rate limited: 30 requests/minute per user
+  ✅ Input validation (question length)
+  ✅ Ownership check for contract access
 """
-from __future__ import annotations
+
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from cuad_index import get_index
+import cuad_index as cuad_idx
+from auth.dependencies import TokenPayload, get_current_user
+from database.connection import get_db
+from database.repositories import ContractRepository
+from middleware.rate_limiter import limiter
 from models import AskRequest, AskResponse, Citation
-from routers.contracts import get_contract_store
 from services.rag import answer_question
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/assistant", tags=["assistant"])
+router = APIRouter(prefix="/api/v1/assistant", tags=["assistant"])
 
 
 @router.post("/ask", response_model=AskResponse)
-async def ask(req: AskRequest):
+@limiter.limit("30/minute")
+async def ask(
+    request: Request,
+    req: AskRequest,
+    current_user: TokenPayload = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Answer a question about a specific contract using the RAG pipeline.
 
-    The assistant:
     1. Retrieves the most relevant clause chunks from ChromaDB
        (filtered by contract_id if it's an uploaded contract)
-    2. Returns a structured answer with clickable citation badges
+    2. Performs ownership check for non-admin users
+    3. Returns a structured answer with clickable citation badges
     """
-    if not req.question.strip():
+    question = req.question.strip()
+    logger.info("Received Legal Assistant query: '%s' (contract_id=%s) from user: %s", question, req.contractId, current_user.email)
+    if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    if len(question) > 2000:
+        raise HTTPException(status_code=400, detail="Question too long (max 2000 chars).")
 
-    index = get_index()
-    store = get_contract_store()
+    index = cuad_idx.get_index()
 
-    # Determine contract name for answer preamble
+    # Look up contract name + ownership check
     contract_name = "this contract"
-    if req.contractId in store:
-        contract_name = store[req.contractId].name
+    effective_id = None
 
-    # For mock contract IDs (c1–c5), query the full CUAD corpus
-    # (no uploaded clauses indexed for them)
-    effective_id = req.contractId if req.contractId in store else None
+    if req.contractId:
+        logger.info("Performing ownership check for contract ID: %s", req.contractId)
+        contract_repo = ContractRepository(db)
+        db_contract = await contract_repo.get(req.contractId)
+
+        if db_contract:
+            # Ownership check: non-admins only access their own contracts
+            if (
+                current_user.role != "admin"
+                and db_contract.owner_id != current_user.user_id
+            ):
+                raise HTTPException(status_code=403, detail="Access denied to this contract.")
+            contract_name = db_contract.name
+            effective_id = req.contractId
 
     result = answer_question(
-        question=req.question.strip(),
+        question=question,
         contract_id=effective_id,
         index=index,
         contract_name=contract_name,
     )
+    logger.info("RAG search returned %d citations for query: '%s'", len(result.get("citations", [])), question)
 
     return AskResponse(
         content=result["content"],

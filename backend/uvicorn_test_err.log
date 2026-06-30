@@ -1,0 +1,16 @@
+INFO:     Started server process [1640]
+INFO:     Waiting for application startup.
+06:46:39 [INFO] contractiq: Initialising database (sqlite+aiosqlite)…
+06:46:39 [INFO] database.connection: \u2705 Database tables ready (sqlite+aiosqlite)
+06:46:39 [INFO] contractiq: Database has 3 users — skipping seed.
+06:46:39 [INFO] contractiq: CUAD CSV: D:\shi\webapp\CUAD_v1\master_clauses.csv
+06:46:39 [INFO] contractiq: ChromaDB dir: ./.chroma_store
+06:46:39 [INFO] cuad_index: Building CUAD index from D:\shi\webapp\CUAD_v1\master_clauses.csv …
+06:46:39 [INFO] cuad_index: Loaded CSV with 510 contracts, 83 columns
+06:46:39 [INFO] cuad_index: Fitting TF-IDF on 5400 clause texts …
+06:46:44 [INFO] cuad_index: TF-IDF centroids built for 39 categories
+06:46:44 [INFO] cuad_index: ChromaDB collection loaded from disk with 5446 documents
+06:46:44 [INFO] cuad_index: CUAD index ready in 5.0s
+06:46:44 [INFO] contractiq: \u2705 ContractIQ backend ready
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)

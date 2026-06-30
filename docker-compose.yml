@@ -1,0 +1,124 @@
+version: '3.9'
+
+# ============================================================
+# ContractIQ — Production Docker Compose
+# ============================================================
+# Usage:
+#   cp backend/.env.example backend/.env    # fill in secrets
+#   docker compose up -d
+#
+# Services:
+#   postgres  — PostgreSQL 15 database
+#   redis     — Redis 7 for token store / rate limiting
+#   backend   — FastAPI + Uvicorn
+#   frontend  — Nginx serving the Vite build
+#   nginx     — Reverse proxy (TLS termination, rate limiting)
+# ============================================================
+
+services:
+
+  # ---- PostgreSQL ----------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: contractiq_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: contractiq
+      POSTGRES_USER: contractiq
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contractiq"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - contractiq_net
+
+  # ---- Redis ---------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: contractiq_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme_in_production}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - contractiq_net
+
+  # ---- Backend -------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: contractiq_backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://contractiq:${POSTGRES_PASSWORD:-changeme_in_production}@postgres:5432/contractiq
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme_in_production}@redis:6379/0
+      ENVIRONMENT: production
+    volumes:
+      - uploads_data:/app/uploads
+      - chroma_data:/app/.chroma_store
+      - cuad_data:/app/cuad_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - contractiq_net
+    expose:
+      - "8000"
+
+  # ---- Frontend ------------------------------------------
+  frontend:
+    build:
+      context: ./webapp
+      dockerfile: Dockerfile
+    container_name: contractiq_frontend
+    restart: unless-stopped
+    networks:
+      - contractiq_net
+    expose:
+      - "80"
+
+  # ---- Nginx (reverse proxy) -----------------------------
+  nginx:
+    image: nginx:alpine
+    container_name: contractiq_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - contractiq_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  chroma_data:
+  cuad_data:
+
+networks:
+  contractiq_net:
+    driver: bridge

@@ -9,10 +9,13 @@ the contracts router.
 """
 from __future__ import annotations
 
+import logging
 import hashlib
 import re
 from datetime import date
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from cuad_index import (
     CUADIndex,
@@ -225,6 +228,7 @@ def analyse_clauses(
       5. Generate deviation description and plain-English explanation
       6. Assign risk level
     """
+    logger.info("Classifier - Starting analysis of %d segments for contract %s", len(segments), contract_id)
     clauses: List[Clause] = []
 
     for i, seg in enumerate(segments):
@@ -290,6 +294,7 @@ def analyse_clauses(
             )
         )
 
+    logger.info("Classifier - Finished analysis. Generated %d annotated clauses.", len(clauses))
     return clauses
 
 

@@ -16,17 +16,87 @@ import re
 from typing import List, Dict, Optional
 
 # ------------------------------------------------------------------ #
+# Exceptions                                                           #
+# ------------------------------------------------------------------ #
+
+class TextExtractionError(ValueError):
+    """Raised when text extraction fails due to format or configuration issues."""
+    pass
+
+class OCRError(TextExtractionError):
+    """Raised when OCR processing itself fails or is unconfigured."""
+    pass
+
+
+# ------------------------------------------------------------------ #
 # PDF parsing                                                          #
 # ------------------------------------------------------------------ #
 
 def parse_pdf(data: bytes) -> str:
-    """Extract plain text from a PDF file's bytes."""
+    """Extract plain text from a PDF file's bytes. Falls back to OCR if scanned."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info("Parsing PDF file bytes using pdfminer...")
     try:
         from pdfminer.high_level import extract_text as _extract
-        text = _extract(io.BytesIO(data))
-        return text or ""
+        text = _extract(io.BytesIO(data)) or ""
     except Exception as exc:
-        raise ValueError(f"PDF parsing failed: {exc}") from exc
+        logger.warning("pdfminer parsing failed: %s. Attempting OCR fallback...", exc)
+        text = ""
+
+    # If text is empty or very short, it's likely a scanned PDF
+    if not text or len(text.strip()) < 100:
+        logger.info("Extracted text is empty or too short (%d chars). PDF appears to be a scanned image. Attempting OCR...", len(text))
+        
+        # Try to import OCR dependencies
+        try:
+            import pdf2image
+            import pytesseract
+        except ImportError:
+            logger.error("OCR dependencies (pytesseract or pdf2image) are not installed in the environment.")
+            raise TextExtractionError(
+                "Text extraction failed: PDF appears to be a scanned image, "
+                "and OCR dependencies (pytesseract or pdf2image) are not installed on the server."
+            )
+            
+        try:
+            # Attempt converting PDF to images (max 10 pages for performance/OOM safety)
+            images = pdf2image.convert_from_bytes(data, first_page=1, last_page=10)
+        except Exception as exc:
+            logger.error("pdf2image conversion failed: %s", exc, exc_info=True)
+            raise OCRError(
+                f"OCR failed: The document pages could not be converted to images. "
+                f"Ensure Poppler is installed on the system. Detail: {exc}"
+            )
+            
+        if not images:
+            logger.error("pdf2image returned no images for PDF.")
+            raise OCRError("OCR failed: No images could be rendered from the PDF document.")
+
+        ocr_text_parts = []
+        for i, img in enumerate(images):
+            logger.info("Running pytesseract OCR on page %d...", i + 1)
+            try:
+                page_text = pytesseract.image_to_string(img)
+                if page_text.strip():
+                    ocr_text_parts.append(page_text)
+            except Exception as exc:
+                logger.error("pytesseract OCR failed on page %d: %s", i + 1, exc, exc_info=True)
+                raise OCRError(
+                    f"OCR failed: Tesseract execution failed. "
+                    f"Verify that Tesseract-OCR is installed and in the system PATH. Detail: {exc}"
+                )
+                
+        ocr_text = "\n\n".join(ocr_text_parts)
+        if len(ocr_text.strip()) < 100:
+            logger.error("OCR completed but extracted text was too short (%d chars).", len(ocr_text))
+            raise OCRError("OCR failed: The scanned document yielded no readable text, likely due to poor scan quality or empty pages.")
+            
+        logger.info("OCR extraction successful: extracted %d characters from scanned PDF.", len(ocr_text))
+        return ocr_text
+
+    return text
 
 
 # ------------------------------------------------------------------ #
@@ -35,13 +105,17 @@ def parse_pdf(data: bytes) -> str:
 
 def parse_docx(data: bytes) -> str:
     """Extract plain text from a DOCX file's bytes."""
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Parsing DOCX file bytes...")
     try:
         from docx import Document
         doc = Document(io.BytesIO(data))
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
         return "\n\n".join(paragraphs)
     except Exception as exc:
-        raise ValueError(f"DOCX parsing failed: {exc}") from exc
+        logger.error("DOCX parsing failed: %s", exc, exc_info=True)
+        raise TextExtractionError(f"DOCX parsing failed: {exc}") from exc
 
 
 # ------------------------------------------------------------------ #

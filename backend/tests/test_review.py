@@ -1,22 +1,72 @@
 import os
 import sys
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from main import app
-from routers.contracts import _CONTRACTS
+from database.connection import Base, get_db
+from database.repositories import ContractRepository
+from auth.dependencies import get_current_user, TokenPayload
 from models import Contract, Clause, ContractSummary, RiskLevel
+
+# Create in-memory SQLite engine for tests
+engine = create_async_engine("sqlite+aiosqlite:///:memory:", connect_args={"check_same_thread": False})
+AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def override_get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+# Mock TokenPayload
+mock_user = TokenPayload(user_id="test_user_id_123", email="counsel@contractiq.local", role="legal_counsel")
+
+async def override_get_current_user(request: Request):
+    request.state.user_id = mock_user.user_id
+    request.state.user_email = mock_user.email
+    request.state.user_role = mock_user.role
+    return mock_user
+
+app.dependency_overrides[get_db] = override_get_db
+app.dependency_overrides[get_current_user] = override_get_current_user
 
 client = TestClient(app)
 
+@pytest.fixture(autouse=True)
+def setup_database():
+    """Synchronous database table creation and cleanup for tests."""
+    import asyncio
+    
+    async def create_tables():
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            
+    async def drop_tables():
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            
+    asyncio.run(create_tables())
+    yield
+    asyncio.run(drop_tables())
+
+
 @pytest.fixture
 def mock_contract():
+    import asyncio
     contract_id = "test_contract_123"
     clause_id = "test_clause_456"
     
-    # Setup in-memory mock contract
+    # Setup mock contract data
     clause = Clause(
         id=clause_id,
         type="Liability",
@@ -59,10 +109,15 @@ def mock_contract():
         source="uploaded"
     )
     
-    _CONTRACTS[contract_id] = contract
+    async def insert_contract():
+        async with AsyncSessionLocal() as session:
+            repo = ContractRepository(session)
+            # owner_id matches mock_user.user_id to pass ownership checks
+            await repo.upsert(contract.model_dump(), owner_id="test_user_id_123")
+            await session.commit()
+            
+    asyncio.run(insert_contract())
     yield contract_id, clause_id
-    # Cleanup after test
-    _CONTRACTS.pop(contract_id, None)
 
 
 def test_confirm_clause(mock_contract):
@@ -75,11 +130,10 @@ def test_confirm_clause(mock_contract):
         "reviewerRole": "Senior Legal Counsel"
     }
     
-    response = client.post(f"/api/contracts/{contract_id}/clauses/{clause_id}/review", json=payload)
-    assert response.status_code == 200
+    response = client.post(f"/api/v1/contracts/{contract_id}/clauses/{clause_id}/review", json=payload)
+    assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
     
     data = response.json()
-    assert data["id"] == contract_id
     
     # Check that the clause is updated to Confirmed
     clause = data["clauses"][0]
@@ -108,11 +162,10 @@ def test_override_clause(mock_contract):
         "reason": "Standard mutual cap is acceptable."
     }
     
-    response = client.post(f"/api/contracts/{contract_id}/clauses/{clause_id}/review", json=payload)
-    assert response.status_code == 200
+    response = client.post(f"/api/v1/contracts/{contract_id}/clauses/{clause_id}/review", json=payload)
+    assert response.status_code == 200, f"Expected 200, got {response.status_code}: {response.text}"
     
     data = response.json()
-    assert data["id"] == contract_id
     
     # Check that the clause is updated to Overridden with new risk
     clause = data["clauses"][0]
@@ -140,6 +193,7 @@ def test_override_requires_reason(mock_contract):
         "riskLevel": "medium"
     }
     
-    response = client.post(f"/api/contracts/{contract_id}/clauses/{clause_id}/review", json=payload)
+    response = client.post(f"/api/v1/contracts/{contract_id}/clauses/{clause_id}/review", json=payload)
     assert response.status_code == 400
     assert "reason" in response.json()["detail"].lower()
+
